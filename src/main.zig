@@ -2,30 +2,54 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
-export fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
+pub fn RecordHandler(
+  comptime Context: type,
+  comptime RecordError: type,
+  // should return true if the attributes should be visited
+  comptime headFn: fn (context: Context, number_of_attributes: u32, rtype: u32) RecordError!bool,
+  // should return false if browsing should be aborted
+  comptime attrFn: fn (context: Context, key: u32, value: u32) RecordError!bool,
+) type {
+  return struct {
+    context: Context,
+    pub const Error = RecordError;
+    const HSelf = @This();
 
-test "basic add functionality" {
-    try testing.expect(add(3, 7) == 10);
+    pub fn head(self: HSelf, number_of_attributes: u32, rtype: u32) Error!bool {
+      return headFn(self.context, number_of_attributes, rtype);
+    }
+
+    pub fn attr(self: HSelf, key: u32, value: u32) Error!bool {
+      return attrFn(self.context, key, value);
+    }
+  };
 }
 
 pub const DocumentReader = struct {
-  src: std.fs.StreamSource,
+  src: std.io.StreamSource,
 
   // cache, mostly to avoid unnecessary syscalls (lseek+read)
   record_cnt: u32,
-  indices_start: u32,
   strtab_len: u32,
 
   const SelfLog = std.log.scoped(.ffstruDocumentReader);
   pub const Self = @This();
+  const headerLen: u32 = 3;
 
-  pub fn init(src: std.fs.StreamSource) !Self {
-    var ret = Document {
+  pub const Error = error {
+    AccessDenied,
+    EndOfStream,
+    InvalidFormat,
+    OutOfBounds,
+    Overflow,
+    Unseekable,
+    Unexpected,
+  } || std.io.StreamSource.ReadError;
+
+  pub fn init(src: std.io.StreamSource) Error!Self {
+    var ret = Self {
       .src = src,
       .record_cnt = 0,
-      .indices_start = 0,
       .strtab_len = 0,
     };
     try ret.reload();
@@ -33,31 +57,32 @@ pub const DocumentReader = struct {
   }
 
   // re-initialize the index cache
-  pub fn reload(self: *Self) !void {
+  pub fn reload(self: *Self) Error!void {
     errdefer {
       self.record_cnt = 0;
-      self.indices_start = 0;
       self.strtab_len = 0;
-    };
+    }
     try self.mySeekTo(0);
     var reader = self.src.reader();
-    const bytes = try reader.readBytesNoEof(16);
-    if (bytes[0..4] != "yFds")
+    const bytes = try reader.readBytesNoEof(headerLen * 4);
+    if (!std.mem.eql(u8, bytes[0..4], "yFds"))
       return error.InvalidFormat;
     self.record_cnt = std.mem.readIntLittle(u32, bytes[4..8]);
-    self.indices_start = std.mem.readIntLittle(u32, bytes[8..12]);
-    self.strtab_len = std.mem.readIntLittle(u32, bytes[12..16]);
-    if (self.indices_start < (4 + self.strtab_len))
-      return error.InvalidFormat;
+    self.strtab_len = std.mem.readIntLittle(u32, bytes[8..12]);
   }
 
-  fn mySeekTo(self: *Self, offset: u32) !void {
+  fn mySeekTo(self: *Self, offset: u32) Error!void {
     try self.src.seekTo(@as(u64, offset) * 4);
   }
 
+  fn indices_start(self: *const Self) u32 {
+    // headerLen =#[ magic, record_cnt, strtab_len ]
+    return headerLen + 2 * self.record_cnt + self.strtab_len;
+  }
+
   // the caller should free the returned string
-  pub fn fetchString(self: *Self, allocator: Allocator, offset: u32, max_size: u32) ![]const u8 {
-    if (offset < 4 or offset >= (4 + self.strtab_len))
+  pub fn fetchString(self: *Self, allocator: Allocator, offset: u32, max_size: u32) Error![]const u8 {
+    if (offset < headerLen or offset >= (headerLen + self.strtab_len))
       return error.OutOfBounds;
 
     try self.mySeekTo(offset);
@@ -73,11 +98,11 @@ pub const DocumentReader = struct {
   // ```
   // computes roughly `strtab[offset] [?cmp?] expected`
   // if ==.Less, then the got value was smaller than the expected one.
-  pub fn compareString(self: *Self, offset: u32, expected: []const u8) !math.Order {
-    if (offset < 4 or offset >= (4 + self.strtab_len))
+  pub fn compareString(self: *Self, offset: u32, expected: []const u8) Error!std.math.Order {
+    if (offset < headerLen or offset >= (headerLen + self.strtab_len))
       return error.OutOfBounds;
-    if (expected.len >= (self.strtab_len * 4))
-      return .lt;
+    if (expected.len >= (self.strtab_len * headerLen))
+      return std.math.Order.lt;
 
     try self.mySeekTo(offset);
     var buf_reader = std.io.bufferedReader(self.src.reader());
@@ -101,17 +126,50 @@ pub const DocumentReader = struct {
     }
   }
 
+  pub const Ref = union(enum) {
+    // 0x0, 0x1
+    boolean: bool,
+    // >= headerLen
+    string: []const u8,
+    // >= headerLen + self.strtab_len
+    record: u32,
+
+    pub fn deinit(self: Self, allocator: Allocator) void {
+      switch (self) {
+        .string => |s| allocator.free(s),
+        else => {}
+      }
+    }
+  };
+
+  pub fn decodeRef(self: *Self, allocator: Allocator, offset: u32, max_size: u32) Error!Ref {
+    return switch (offset) {
+      0 => .{ .boolean = false },
+      1 => .{ .boolean = true  },
+      2 => error.OutOfBounds,
+      else =>
+        if (offset >= self.indices_start())
+          error.OutOfBounds
+        else if (offset >= headerLen + self.strtab_len)
+          .{ .record = offset }
+        else
+          self.fetchString(allocator, offset, max_size)
+    };
+  }
+
   fn handleSeekOverflow(seek_to: *u32, next: u32) error{Overflow}!void {
-    if (seek_to.* > (0xffffffff - next)) {
+    if (seek_to.* > (std.math.maxInt(u32) - next)) {
       return error.Overflow;
     } else {
       seek_to.* += next;
     }
   }
 
+  const attrIndexHeaderLen: u32 = 3;
+
   // if successful, returns the offset of the index
   // if just not found, returns EndOfStream
-  fn findAttrIndexIntern(self: *Self, seek_to: *u32, attrname: []const u8) !?u32 {
+  fn findAttrIndexIntern(self: *Self, seek_to: *u32, attrname: []const u8) Error!?u32 {
     try self.mySeekTo(seek_to.*);
     var buf_reader = std.io.bufferedReader(self.src.reader());
     var cnt_reader = std.io.countingReader(buf_reader.reader());
@@ -121,160 +179,88 @@ pub const DocumentReader = struct {
       const cur_next = try reader.readIntLittle(u32);
 
       if (cur_itype != 0) {
-        try Self.handle_seek_overflow(seek_to, cur_next);
-        return null;
-      }
-
-      const records_cnt = cur_next / 2;
-      const indexed_attribute = try reader.readIntLittle(u32);
-      const ret = seek_to.* + (cnt_reader.bytes_read / 4) - 4;
-
-      if (try self.compareString(indexed_attribute, attrname) != .Less) {
-        // itype, next, _: u32
-        try Self.handleSeekOverflow(seek_to, 3);
         try Self.handleSeekOverflow(seek_to, cur_next);
         return null;
       }
 
-      return ret;
+      const indexed_attribute = try reader.readIntLittle(u32);
+      const ret = seek_to.* + (cnt_reader.bytes_read / 4) - attrIndexHeaderLen;
+      if (ret > std.math.maxInt(u32))
+        return error.Overflow;
+
+      if ((try self.compareString(indexed_attribute, attrname)) != .eq) {
+        try Self.handleSeekOverflow(seek_to, cur_next);
+        return null;
+      }
+
+      return @intCast(u32, ret);
     }
   }
 
   /// if successful, returns the offset of the index
-  /// wraps `find_attr_index_intern` to prevent accidentially using corrupted reader structs
-  pub fn findAttrIndex(self: *Self, attrname: []const u8) !?u32 {
-    var seek_to = self.indices_start.*;
+  /// wraps `findAttrIndexIntern` to prevent accidentially using corrupted reader structs
+  pub fn findAttrIndex(self: *Self, attrname: []const u8) Error!?u32 {
+    var seek_to = self.indices_start();
     while (true) {
-      if (self.findAttrIndexIntern(&seek_to, itype, attrname)) |tmp| {
+      if (self.findAttrIndexIntern(&seek_to, attrname)) |tmp| {
         if (tmp) |val| return val;
+        // itype, next, _: u32
+        try Self.handleSeekOverflow(&seek_to, attrIndexHeaderLen);
         // otherwise try again with new seek position
       } else |err| {
-        return if (err == .EndOfStream) null else err;
+        return if (err == error.EndOfStream) null else err;
       }
     }
   }
 
-  /// `index_pos` should be determined via `find_attr_index`.
+  /// `index_pos` should be determined via `findAttrIndex`.
   /// if successful, returns the offset of the record
-  pub fn searchAttr(self: *Self, index_pos: u32, key: []const u8) !?u32 {
-    if (index_pos < self.indices_start.*)
+  pub fn searchAttr(self: *Self, index_pos: u32, key: []const u8) Error!?u32 {
+    if (index_pos < self.indices_start())
       return error.OutOfBounds;
     try self.mySeekTo(index_pos);
-    var cur_next: u32 = undefined;
-    {
-      var reader = self.reader();
-      const itype = try reader.readIntLittle(u32);
-      if (itype != 0)
-        return error.InvalidFormat;
-      cur_next = try reader.readIntLittle(u32);
-    }
+    // IMPORTANT: we can't use any buffering reader here
+    const reader = self.src.reader();
+    if ((try reader.readIntLittle(u32)) != @as(u32, 0))
+      return error.InvalidFormat;
+    const cur_next = try reader.readIntLittle(u32);
     const records_cnt = cur_next / 2;
 
-    var level_start_segment: u32 = 0;
-    // each segment consists of 512 key-record-ref pairs
-    const segment_size = 1024;
-    var sel_segment: u32 = 0;
-    var segment_buf = std.BoundedArray(u8, 4 * segment_size).init(0) catch unreachable;
-    // each level consists of 513^level_id segments.
-    const slevel_base = 513;
+    // binary search
+    const middle_base = index_pos + attrIndexHeaderLen;
+    var left: u32 = 0;
+    var right: u32 = records_cnt - 1;
+    var buf: [8]u8 = undefined;
 
-    while (true) {
-      SelfLog.debug(
-          "search_attr: level_start_segment = {d}; sel_segment = {d}",
-          .{ level_start_segment, sel_segment });
-      if (sel_segment < level_start_segment)
-        unreachable;
-      if (sel_segment * segment_size >= records_cnt)
-        return null;
-
-      // load the entire segment
-      {
-        segment_data.len = 4096;
-        self.mySeekTo(index_pos + 4 + sel_segment * segment_size) catch |err| {
-          // if we can't seek at all in the file, then the user
-          // has no easy way to get the `index_pos`, so we don't
-          // need to consider that case.
-          return if (err == .Unseekable) null else err;
-        };
-        const segment_cutoff = self.src.reader().readAll(segment_buf.slice()) catch |err| {
-          return if (err == .EndOfStream) null else err;
-        };
-        // normally, I would check here if segment_cutoff % 8 == 0, but
-        // that might make working with truncated files unnecessary cumbersome.
-        segment_buf.resize(segment_cutoff - segment_cutoff % 8) catch unreachable;
+    while (left <= right) {
+      const middle = left + (right - left) / 2;
+      try self.mySeekTo(middle_base + middle * 2);
+      try reader.readNoEof(&buf);
+      const tmp = try self.compareString(std.mem.readIntLittle(u32, buf[0..4]), key);
+      switch (tmp) {
+        .eq => {
+          // value found
+          return std.mem.readIntLittle(u32, buf[4..8]);
+        },
+        .lt => {
+          // middle < key => continue right
+          left = middle + 1;
+        },
+        .gt => {
+          // middle > key => continue left
+          if (middle == 0) {
+            // prevent underflow
+            break;
+          }
+          right = middle - 1;
+        },
       }
-      // we don't parse the entire array because it would just trash the cache again,
-      // and don't give us any speed benefit.
-
-      // segment is empty, nothing to search
-      if (segment_data.len < 8)
-        return null;
-
-      // binary search in the segment, it's a sorted list.
-      // if this isn't fast enough, we should compare it to sequential search.
-
-      var left: u16 = 0;
-      var right: u16 = segment_data.len - 8;
-      while (left <= right) {
-        const middle = left + ((right - left) / 2);
-        if (middle % 8 != 0)
-          unreachable;
-        const middle_val1 = std.mem.readIntLittle(u32, segment_data[middle..middle + 4]);
-        switch (try self.compareString(middle_val1, key)) {
-          .eq => {
-            // value found
-            return std.mem.readIntLittle(u32, segment_data[middle + 4..middle + 8]);
-          }
-          .lt => {
-            // middle < key => continue right
-            left = middle + 8;
-          }
-          .gt => {
-            // middle > key => continue left
-            if (middle == 0) {
-              // prevent underflow
-              left = 0;
-              right = 0;
-              break;
-            }
-            right = middle - 8;
-          }
-        }
-      }
-
-      // calculate subsegment
-      const subsnr = left / 8;
-      const next_level_start_segment = (level_start_segment + 1) * slevel_base - 1;
-      const prev_offset = sel_segment - level_start_segment;
-      sel_segment = next_level_start_segment + slevel_base * prev_offset + subsnr;
-      level_start_segment = next_level_start_segment;
     }
+
+    return null;
   }
 
-  pub fn RecordHandler(
-    comptime Context: type,
-    comptime RecordError: type,
-    // should return true if the attributes should be visited
-    comptime headFn: fn (context: Context, number_of_attributes: u32, rtype: u32) RecordError!bool,
-    // should return false if browsing should be aborted
-    comptime attrFn: fn (context: Context, key: u32, value: u32) RecordError!bool,
-  ) type {
-    return struct {
-      context: Context,
-      pub const Error = RecordError;
-      const HSelf = @This();
-
-      pub fn head(self: Self, number_of_attributes: u32, rtype: u32) Error!bool {
-        return headFn(self.context, number_of_attributes, rtype);
-      }
-
-      pub fn attr(self: Self, key: u32, value: u32) Error!bool {
-        return attrFn(self.context, key, value);
-      }
-    };
-  }
-
-  pub fn browseRecord(self: *Self, record_offset: u32, handler: anytype) !bool {
+  pub fn browseRecord(self: *Self, record_offset: u32, handler: anytype) (Error || @TypeOf(handler).Error)!bool {
     try self.mySeekTo(record_offset);
     var buf_reader = std.io.bufferedReader(self.src.reader());
     var reader = buf_reader.reader();
@@ -284,10 +270,10 @@ pub const DocumentReader = struct {
       if (!try handler.head(number_of_attributes, rtype))
         return false;
     }
-    var attri = 0;
+    var attri: u32 = 0;
     while (attri < number_of_attributes) : (attri += 1) {
       const key = try reader.readIntLittle(u32);
-      const value = try.reader.readIntLittle(u32);
+      const value = try reader.readIntLittle(u32);
       if (!try handler.attr(key, value))
         return false;
     }
@@ -298,16 +284,16 @@ pub const DocumentReader = struct {
 /// NOTE: all `u32` values in the header are indices, which means that
 /// they refer to (val * 4) instead of (val) ; this is an optimization
 /// to deal with larger files (up to 16GiB) while still using 32bit indices.
-pub const DocumentHeader = {
+pub const DocumentHeader = struct {
   record_cnt: u32,
-  indices_start: u32,
   strtab_len: u32,
 
-  const Self = @This();
+  // length in 32bit units.
+  pub const ilen: u32 = 3;
 
-  pub fn writeTo(self: Self, writer: anytype) writer.Error!void {
+  pub fn writeTo(self: @This(), writer: anytype) !void {
+    try writer.writeAll("yFds");
     try writer.writeIntLittle(u32, self.record_cnt);
-    try writer.writeIntLittle(u32, self.indices_start);
     try writer.writeIntLittle(u32, self.strtab_len);
   }
 };
@@ -320,143 +306,144 @@ pub fn appendToStringTable(tab: *std.ArrayList(u8), toapp: []const u8) !u32 {
   for (tab.items) |item, idx| {
     if (item == 0 and idx > toapp.len) {
       const potstart = idx - toapp.len;
-      if (std.mem.eql(tab.items[potstart..idx], toapp)) {
-        return potstart;
+      if (potstart % 4 == 0 and std.mem.eql(u8, tab.items[potstart..idx], toapp)) {
+        const ret = potstart / 4;
+        if (ret > @as(usize, std.math.maxInt(u32)))
+          unreachable;
+        return @intCast(u32, ret);
       }
     }
   }
-  // not already present
-  const ret = tab.items.len;
+  if (tab.items.len % 4 != 0) {
+    std.debug.print("tab.items.len = {d}\n", .{ tab.items.len });
+    @panic("string table with invalid padding");
+  }
+  if (tab.items.len + toapp.len > 4 * @as(usize, std.math.maxInt(u32)))
+    return error.Overflow;
+  const ret = @intCast(u32, tab.items.len / 4);
+  const padding = 5 - (toapp.len + 1) % 4;
+  try tab.ensureUnusedCapacity(toapp.len + padding);
   try tab.appendSlice(toapp);
-  return ret;
-}
-
-/// add necessary padding to the string table
-pub fn finishStringTable(tab: *std.ArrayList(u8)) !void {
-  const padding = tab.items.len % 4;
-  var i = 0;
-  try tab.ensureUnusedCapacity(3);
+  var i: usize = 0;
   while (i < padding) : (i += 1) {
-    (tab.addOneAssumeCapacity().*) = 0;
+    tab.addOneAssumeCapacity().* = 0;
   }
+  return DocumentHeader.ilen + ret;
 }
 
-pub const AttrIndexBuilder = {
-  dst: std.io.StreamSource,
-  start: u64,
-  len: u32,
-
-  const Self = @This();
-
-  pub fn init(dst: std.io.StreamSource, indexed_attribute: u32) !Self {
-    var writer = dst.writer();
-    // itype
-    try writer.writeIntLittle(u32, 0);
-    // next
-    try writer.writeIntLittle(u32, 0);
-    // indexed_attribute
-    try writer.writeIntLittle(u32, indexed_attribute);
-    return Self {
-      .dst = dst,
-      .start = try dst.getPos(),
-      .len = 0,
-    };
-  }
-
-  pub fn finish(self: Self) !void {
-    try self.dst.seekTo(self.start + 4);
-    try self.dst.writeIntLittle(u32, self.len);
-  }
-
-  pub fn 
-};
-
-pub struct AttrIndexKeyValue = struct {
+pub const AttrIndexKeyValue = struct {
   key: u32,
   value: u32,
 
-  pub fn writeTo(self: Self, writer: anytype) writer.Error!void {
+  pub fn writeTo(self: @This(), writer: anytype) !void {
     try writer.writeIntLittle(u32, self.key);
     try writer.writeIntLittle(u32, self.value);
   }
 };
 
-const serSegment: [_]AttrIndexKeyValue = [4096 / 8].{
-  // sentinel values
-  key: 0,
-  value: 0,
-};
-
-const btreeifyRestrict = enum {
-  Left,
-  Right,
-  
-};
-
-fn attrIndexBtreeify(
-  segments: []serSegment,
-  level_id: u16,
-  sel_segment: usize,
-  kvps: []AttrIndexKeyValue,
-  sgleft: u32,
-  sgright: u32,
-  
-) !void {
-  if (kvps.items.len == 0)
-    return;
-  if (sgleft > sgright)
-    unreachable;
-  const sgmiddle = sgleft + (sgright - sgleft) / 2;
-  const inmiddle = kvps.len / 2;
-
-  segments[sel_segment][sgmiddle] = kvps[inmiddle];
-
-  if (sgleft != sgright) {
-    // left branch
-    try attrIndexBtreeify(segments, level_id, );
-    // right branch
-    try attrIndexBtreeify(segments, level_id, );
-  } else {
-    // next left segment
-    try attrIndexBtreeify(segments, level_id + 1, );
-  }
-}
-
 pub fn serializeAttrIndex(
-  allocator: Allocator,
   indexed_attribute: u32,
   // list MUST be ordered 
   kvps: []AttrIndexKeyValue,
   writer: anytype,
 ) !void {
-  // calculate levels and segments
-  var segments = std.ArrayList(serSegment).initCapacity(allocator, kvps.items.len / 512);
-  defer segments.deinit();
-
-  // perform B+-Tree-ify
-  try attrIndexBtreeify(segments.items, 0, 0, kvps, 0, 512);
-  // terminating right segment
-  try attrIndex
-
-  // write results
-  //  exclude unnecessary trailing segments
-  var full_segments = segments.len;
-  while (full_segments > 0) : (full_segments -= 1) {
-    if (segments[full_segments - 1].len != 0)
-      break;
-  }
-
   //  itype
   try writer.writeIntLittle(u32, 0);
   //  next
-  try writer.writeIntLittle(u32, full_segments * 512);
+  if (kvps.len > @as(usize, std.math.maxInt(u32)) / 2)
+    return error.Overflow;
+  try writer.writeIntLittle(u32, @intCast(u32, kvps.len * 2));
   //  indexed_attribute
   try writer.writeIntLittle(u32, indexed_attribute);
   //  records_offsets
-  for (segments.items) |segment, sgidx| {
-    if (sgidx >= full_segments)
-      break;
-    for (segment.slice()) |sgkvps|
-      try sgkvps.writeTo(writer);
+  for (kvps) |kvp| try kvp.writeTo(writer);
+}
+
+const test_allocator = std.testing.allocator;
+const test_expect = std.testing.expectEqual;
+
+test "simple" {
+  var buffer: [4096]u8 = undefined;
+  var bufstream = std.io.StreamSource { .buffer = std.io.fixedBufferStream(&buffer) };
+
+  const BaseDate = struct {
+    key: []const u8,
+    value: []const u8,
+  };
+
+  const basedata = [_]BaseDate{
+    .{ .key = "hello", .value = "world" },
+  };
+
+  // construct a simple document
+  var aid: u32 = undefined;
+  {
+    var strtab = std.ArrayList(u8).init(test_allocator);
+    defer strtab.deinit();
+    var recs = std.ArrayList(AttrIndexKeyValue).init(test_allocator);
+    defer recs.deinit();
+
+    aid = try appendToStringTable(&strtab, "attr 4 index");
+    for (basedata) |bd| {
+      const k = try appendToStringTable(&strtab, bd.key);
+      const v = try appendToStringTable(&strtab, bd.value);
+      (try recs.addOne()).* = .{ .key = k, .value = v };
+    }
+    try test_expect(strtab.items.len, 4 * 8);
+
+    const writer = bufstream.writer();
+    try (DocumentHeader {
+      .record_cnt = 2,
+      .strtab_len = @intCast(u32, strtab.items.len / 4),
+    }).writeTo(writer);
+    try writer.writeAll(strtab.items);
+
+    try writer.writeIntLittle(u32, 1);
+    try writer.writeIntLittle(u32, 0);
+    for (recs.items) |rec| try rec.writeTo(writer);
+
+    try serializeAttrIndex(aid, recs.items, writer);
   }
+  bufstream.seekTo(0) catch unreachable;
+
+  // check reading/deserializing document
+  var docread = try DocumentReader.init(bufstream);
+
+  // test strings
+  try test_expect(@as(anyerror!std.math.Order, .eq), docread.compareString(aid, "attr 4 index"));
+
+  // test index capabilities
+  const a4ii_ = try docread.findAttrIndex("attr 4 index");
+  try test_expect(@as(?u32, 15), a4ii_);
+  const a4ii = a4ii_.?;
+  try test_expect(@as(?u32, null), try docread.searchAttr(a4ii, "unknown"));
+  try test_expect(@as(?u32, 9), try docread.searchAttr(a4ii, "hello"));
+
+  // test record stuff
+  const Rech = struct {
+    calls: *u32,
+    pub const Error = anyerror;
+    const HSelf = @This();
+
+    pub fn head(self: HSelf, number_of_attributes: u32, rtype: u32) Error!bool {
+      self.calls.* += 0xf00;
+      try test_expect(number_of_attributes, 1);
+      try test_expect(rtype, 0);
+      return true;
+    }
+
+    pub fn attr(self: HSelf, key: u32, value: u32) Error!bool {
+      self.calls.* += 0x00f;
+      try test_expect(@as(u32, 7), key);
+      try test_expect(@as(u32, 9), value);
+      return true;
+    }
+  };
+
+  var rech_calls: u32 = 0;
+  const rech = Rech {
+    .calls = &rech_calls,
+  };
+  _ = try docread.browseRecord(3 + 8, rech);
+  try test_expect(rech_calls, 0xf0f);
 }

@@ -20,15 +20,13 @@
 ```zig
 magic: u32 = 0x73644679 // "yFds" little-endian
 record_cnt: u32,
-// the following is an index, so it omits the last 2 bits
-indices_start: u32,
-// this is also an index
+// this is an index, so it measures length in 32bit units.
 strtab_len: u32,
 // the string table gets padded to 4 bytes,
 // filled up with zeros at the end
 strtab: [strtab_len * 4]u8,
 
-records: [record_cnt]Record,
+records: []Record, // sizeof(records) / (2 * sizeof(u32))
 indices: [.implicit]Index,
 
 pub const Record = struct {
